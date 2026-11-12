@@ -1,0 +1,162 @@
+// Unity 6 (6000.x). Place in Assets/__PACK_ID__/Editor/.
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.Animations;
+using UnityEngine;
+
+namespace VideoSpriteDelivery.__PACK_ID__
+{
+    public static class ImportVideoSprites
+    {
+        const string Root = "Assets/__PACK_ID__";
+        const string Generated = Root + "/Generated";
+
+        [Serializable] public class Manifest
+        {
+            public int width, height;
+            public string defaultAnimation;
+            public float pivotX, pivotY, pixelsPerUnit;
+            public Move[] animations;
+        }
+        [Serializable] public class Move
+        {
+            public string name;
+            public string[] files;
+            public float[] durationMs;
+            public bool loop;
+        }
+
+        [MenuItem("Tools/Video Sprites/Build __PACK_ID__")]
+        public static void Build()
+        {
+            var manifestPath = Root + "/VideoSpritesManifest.json";
+            if (!File.Exists(manifestPath))
+                throw new FileNotFoundException("Copy the package's Assets/__PACK_ID__ folder into this project.", manifestPath);
+            var manifest = JsonUtility.FromJson<Manifest>(File.ReadAllText(manifestPath));
+            if (manifest == null || manifest.animations == null || manifest.animations.Length == 0)
+                throw new InvalidDataException("No animations in the manifest.");
+            if (manifest.pixelsPerUnit <= 0 || manifest.width <= 0 || manifest.height <= 0)
+                throw new InvalidDataException("Invalid size or pixels-per-unit.");
+            // Validate all inputs before importing or updating generated assets.
+            foreach (var move in manifest.animations)
+            {
+                if (move.files == null || move.durationMs == null || move.files.Length == 0 || move.files.Length != move.durationMs.Length)
+                    throw new InvalidDataException("Invalid frame list: " + move.name);
+                for (int i = 0; i < move.files.Length; ++i)
+                {
+                    if (move.durationMs[i] <= 0 || !File.Exists(Root + "/" + move.files[i]))
+                        throw new InvalidDataException("Missing frame or invalid duration: " + move.files[i]);
+                }
+            }
+            Directory.CreateDirectory(Generated);
+            AssetDatabase.Refresh();
+            var clips = new Dictionary<string, AnimationClip>();
+            var firstSprites = new Dictionary<string, Sprite>();
+            foreach (var move in manifest.animations)
+            {
+                var sprites = new List<Sprite>();
+                foreach (var file in move.files)
+                {
+                    string path = Root + "/" + file;
+                    var importer = AssetImporter.GetAtPath(path) as TextureImporter;
+                    if (importer == null) throw new InvalidDataException("Not an imported texture: " + path);
+                    importer.textureType = TextureImporterType.Sprite;
+                    importer.spriteImportMode = SpriteImportMode.Single;
+                    importer.spritePixelsPerUnit = manifest.pixelsPerUnit;
+                    importer.alphaIsTransparency = true;
+                    importer.mipmapEnabled = false;
+                    importer.filterMode = FilterMode.Bilinear;
+                    importer.wrapMode = TextureWrapMode.Clamp;
+                    importer.npotScale = TextureImporterNPOTScale.None;
+                    importer.textureCompression = TextureImporterCompression.Uncompressed;
+                    importer.maxTextureSize = 1024;
+                    var settings = new TextureImporterSettings();
+                    importer.ReadTextureSettings(settings);
+                    settings.spriteAlignment = (int)SpriteAlignment.Custom;
+                    settings.spritePivot = new Vector2(manifest.pivotX, manifest.pivotY);
+                    settings.spriteMeshType = SpriteMeshType.FullRect;
+                    importer.SetTextureSettings(settings);
+                    importer.SaveAndReimport();
+                    var sprite = AssetDatabase.LoadAssetAtPath<Sprite>(path);
+                    if (sprite == null) throw new InvalidDataException("Sprite import failed: " + path);
+                    sprites.Add(sprite);
+                }
+                string clipPath = Generated + "/" + move.name + ".anim";
+                var clip = AssetDatabase.LoadAssetAtPath<AnimationClip>(clipPath);
+                bool isNew = clip == null;
+                if (isNew) clip = new AnimationClip();
+                clip.name = move.name;
+                clip.frameRate = 1000f / move.durationMs[0];
+                var keys = new ObjectReferenceKeyframe[sprites.Count + 1];
+                float time = 0f;
+                for (int i = 0; i < sprites.Count; ++i)
+                {
+                    keys[i] = new ObjectReferenceKeyframe { time = time, value = sprites[i] };
+                    time += move.durationMs[i] / 1000f;
+                }
+                // Hold the final sprite for its full duration, rather than
+                // letting the clip stop at the start of its last frame.
+                keys[sprites.Count] = new ObjectReferenceKeyframe { time = time, value = sprites[sprites.Count - 1] };
+                var binding = EditorCurveBinding.PPtrCurve("", typeof(SpriteRenderer), "m_Sprite");
+                AnimationUtility.SetObjectReferenceCurve(clip, binding, keys);
+                var clipSettings = AnimationUtility.GetAnimationClipSettings(clip);
+                clipSettings.loopTime = move.loop;
+                AnimationUtility.SetAnimationClipSettings(clip, clipSettings);
+                if (isNew) AssetDatabase.CreateAsset(clip, clipPath);
+                else EditorUtility.SetDirty(clip);
+                clips.Add(move.name, clip);
+                firstSprites.Add(move.name, sprites[0]);
+            }
+            string defaultName = string.IsNullOrEmpty(manifest.defaultAnimation) ? manifest.animations[0].name : manifest.defaultAnimation;
+            if (!clips.ContainsKey(defaultName)) throw new InvalidDataException("Default animation missing");
+            string controllerPath = Generated + "/__PACK_ID__.controller";
+            var controller = AssetDatabase.LoadAssetAtPath<AnimatorController>(controllerPath);
+            if (controller == null) controller = AnimatorController.CreateAnimatorControllerAtPath(controllerPath);
+            var machine = controller.layers[0].stateMachine;
+            var states = new Dictionary<string, AnimatorState>();
+            foreach (var move in manifest.animations)
+            {
+                var state = FindOrCreate(machine, move.name);
+                state.motion = clips[move.name];
+                states.Add(move.name, state);
+            }
+            machine.defaultState = states[defaultName];
+            bool defaultLoops = manifest.animations.First(m => m.name == defaultName).loop;
+            foreach (var move in manifest.animations)
+            {
+                var state = states[move.name];
+                // This generated controller owns these outgoing transitions.
+                foreach (var old in state.transitions) state.RemoveTransition(old);
+                if (!move.loop && move.name != defaultName && defaultLoops)
+                {
+                    var back = state.AddTransition(states[defaultName]);
+                    back.hasExitTime = true; back.exitTime = 1f; back.duration = 0f;
+                }
+            }
+            EditorUtility.SetDirty(controller);
+            var obj = new GameObject("__PACK_ID__");
+            try
+            {
+                obj.AddComponent<SpriteRenderer>().sprite = firstSprites[defaultName];
+                var animator = obj.AddComponent<Animator>();
+                animator.runtimeAnimatorController = controller;
+                animator.applyRootMotion = false;
+                PrefabUtility.SaveAsPrefabAsset(obj, Generated + "/__PACK_ID__.prefab");
+            }
+            finally { UnityEngine.Object.DestroyImmediate(obj); }
+            AssetDatabase.SaveAssets();
+            AssetDatabase.Refresh();
+            Selection.activeObject = AssetDatabase.LoadAssetAtPath<GameObject>(Generated + "/__PACK_ID__.prefab");
+            Debug.Log("Video sprites ready: " + Generated + ". Use Animator.Play(actionName) to switch.");
+        }
+
+        static AnimatorState FindOrCreate(AnimatorStateMachine machine, string name)
+        {
+            var state = machine.states.FirstOrDefault(s => s.state.name == name).state;
+            return state != null ? state : machine.AddState(name);
+        }
+    }
+}

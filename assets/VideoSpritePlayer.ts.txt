@@ -1,0 +1,145 @@
+// Cocos Creator 3.8: native clips with explicit per-frame timing.
+import {
+    _decorator, Animation, AnimationClip, Component, JsonAsset, Sprite,
+    ImageAsset, Texture2D, SpriteFrame, UITransform, Vec2, resources, isValid, animation,
+} from 'cc';
+
+const { ccclass, property, requireComponent } = _decorator;
+type Move = { name: string; files: string[]; durationMs: number[]; loop: boolean };
+type Manifest = {
+    width: number; height: number; pivotX: number; pivotY: number;
+    animations: Move[]; defaultAnimation: string;
+};
+
+@ccclass('__PACK_ID__VideoSpritePlayer')
+@requireComponent(Sprite)
+export class __PACK_ID__VideoSpritePlayer extends Component {
+    @property initialAction = ''; 
+    @property autoPlay = true;
+    @property returnToDefault = true;
+
+    private animation: Animation | null = null;
+    private acquired = new Set<SpriteFrame>();
+    private sourceImages = new Set<ImageAsset>();
+    private textures: Texture2D[] = [];
+    private clips: AnimationClip[] = [];
+    private ready = false;
+    private currentAction = '';
+    private defaultAction = '';
+    private defaultLoops = false;
+
+    onLoad(): void {
+        this.initialize().catch((error: unknown) => {
+            if (isValid(this)) console.error('[__PACK_ID__VideoSpritePlayer]', error);
+        });
+    }
+
+    private async initialize(): Promise<void> {
+        const json = await new Promise<JsonAsset>((resolve, reject) => {
+            resources.load('VideoSprites/__PACK_ID__/manifest', JsonAsset, (error, asset) => {
+                if (error) reject(error); else resolve(asset);
+            });
+        });
+        if (!isValid(this)) return;
+        const manifest = json.json as Manifest;
+        const loaded = await Promise.all(manifest.animations.map(async move => {
+            if (!move.files.length || move.files.length !== move.durationMs.length ||
+                move.durationMs.some(d => !Number.isFinite(d) || d <= 0)) {
+                throw new Error(`Invalid animation manifest: ${move.name}`);
+            }
+            const images = await Promise.all(move.files.map(file => {
+                const path = 'VideoSprites/__PACK_ID__/' + file.replace(/\.png$/i, '');
+                return new Promise<ImageAsset>((resolve, reject) => {
+                    resources.load(path, ImageAsset, (error, image) => {
+                        if (error) reject(error); else resolve(image);
+                    });
+                });
+            }));
+            return { move, images };
+        }));
+        if (!isValid(this)) return;
+        const sprite = this.getComponent(Sprite)!;
+        sprite.sizeMode = Sprite.SizeMode.CUSTOM;
+        // Frames keep the manifest's full canvas coordinates. Disable
+        // trim-based drawing so an asymmetric pose cannot change its offset.
+        sprite.trim = false;
+        const transform = this.getComponent(UITransform) || this.addComponent(UITransform);
+        if (!transform) throw new Error('Cannot create UITransform');
+        transform.setContentSize(manifest.width, manifest.height);
+        transform.setAnchorPoint(new Vec2(manifest.pivotX, manifest.pivotY));
+        this.animation = this.getComponent(Animation) || this.addComponent(Animation);
+        if (!this.animation) throw new Error('Cannot create Animation component');
+        const firstFrames = new Map<string, SpriteFrame>();
+        for (const { move, images } of loaded) {
+            const frames = images.map(image => {
+                if (!this.sourceImages.has(image)) { image.addRef(); this.sourceImages.add(image); }
+                const texture = new Texture2D();
+                texture.image = image;
+                this.textures.push(texture);
+                const frame = new SpriteFrame();
+                frame.texture = texture;
+                this.acquired.add(frame);
+                return frame;
+            });
+            firstFrames.set(move.name, frames[0]);
+            const clip = new AnimationClip();
+            clip.name = move.name;
+            clip.sample = 60;
+            const track = new animation.ObjectTrack<SpriteFrame>();
+            track.path = new animation.TrackPath().toComponent('cc.Sprite').toProperty('spriteFrame');
+            let time = 0;
+            const keys: [number, SpriteFrame][] = frames.map((frame, index) => {
+                const key: [number, SpriteFrame] = [time, frame];
+                time += move.durationMs[index] / 1000;
+                return key;
+            });
+            Array.from(track.channels())[0].curve.assignSorted(keys);
+            clip.duration = time;
+            clip.addTrack(track);
+            clip.wrapMode = move.loop ? AnimationClip.WrapMode.Loop : AnimationClip.WrapMode.Normal;
+            this.animation.createState(clip, move.name);
+            this.clips.push(clip);
+        }
+        this.animation.on(Animation.EventType.FINISHED, this.onFinished, this);
+        this.ready = true;
+        const first = loaded.find(item => item.move.name === (this.initialAction || manifest.defaultAnimation)) || loaded[0];
+        if (!first) throw new Error('No animations in manifest');
+        sprite.spriteFrame = firstFrames.get(first.move.name)!;
+        this.defaultAction = first.move.name;
+        this.defaultLoops = first.move.loop;
+        if (this.autoPlay) this.play(first.move.name);
+        this.node.emit('video-sprite-ready');
+    }
+
+    public play(action: string): boolean {
+        if (!this.ready || !this.animation || !this.animation.getState(action)) return false;
+        this.currentAction = action;
+        this.animation.play(action);
+        return true;
+    }
+
+    public pause(): void { this.animation?.pause(); }
+    public resume(): void { this.animation?.resume(); }
+
+    private onFinished(): void {
+        const finished = this.currentAction;
+        this.node.emit('video-sprite-finished', finished);
+        if (this.returnToDefault && this.defaultLoops && finished !== this.defaultAction && this.currentAction === finished) this.play(this.defaultAction);
+    }
+
+    onDestroy(): void {
+        if (this.animation) {
+            this.animation.off(Animation.EventType.FINISHED, this.onFinished, this);
+            this.animation.stop();
+            for (const clip of this.clips) this.animation.removeState(clip.name);
+        }
+        for (const clip of this.clips) clip.destroy();
+        const sprite = this.getComponent(Sprite);
+        if (sprite && isValid(sprite)) sprite.spriteFrame = null;
+        for (const frame of this.acquired) frame.destroy();
+        for (const texture of this.textures) texture.destroy();
+        for (const image of this.sourceImages) image.decRef();
+        this.acquired.clear();
+        this.sourceImages.clear();
+    }
+}

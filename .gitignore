@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 运行产物与用户素材（不入库）
+work/
+outputs/
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.avi
+
+# 本地分割模型缓存
+*.onnx
+u2net*/
+
+# 系统文件
+.DS_Store
+Thumbs.db

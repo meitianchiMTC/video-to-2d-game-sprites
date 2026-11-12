@@ -1,0 +1,4 @@
+interface:
+  display_name: "视频转 2D 游戏精灵"
+  short_description: "将视频提取为透明序列帧，支持主体选择、动作拆分与 Cocos、Unity 导出"
+  default_prompt: "请使用 $video-to-2d-game-sprites 把我提供的视频整理成 2D 游戏序列帧；沿用已明确的信息，只询问主体、引擎版本或动作需求中的关键缺项。"
