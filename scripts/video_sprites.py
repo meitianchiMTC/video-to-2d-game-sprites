@@ -18,6 +18,241 @@ from PIL import Image, ImageDraw
 
 
 MASK_PIPELINE_VERSION = 2
+STABILIZE_VERSION = 1
+SEAM_VERSION = 1
+
+
+def stabilize_config(cfg):
+    """Normalize automatic camera-stabilization settings (default: auto)."""
+    raw = cfg.get('stabilize')
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError('stabilize must be an object')
+    mode = raw.get('mode', 'auto')
+    if mode not in ('off', 'auto'):
+        raise ValueError('stabilize.mode must be off or auto')
+    border = raw.get('border', 'replicate')
+    if border not in ('replicate', 'reflect', 'constant'):
+        raise ValueError('stabilize.border must be replicate, reflect or constant')
+    reference = raw.get('reference', 'middle')
+    if reference not in ('middle', 'first') and (isinstance(reference, bool) or not isinstance(reference, int)):
+        raise ValueError('stabilize.reference must be middle, first or a frame index')
+    max_shift = float(raw.get('max_shift', 24))
+    activate = float(raw.get('activate_shift', 1.0))
+    min_response = float(raw.get('min_response', 0.03))
+    smooth = int(raw.get('smooth', 7))
+    if (not math.isfinite(max_shift) or max_shift <= 0 or
+            not math.isfinite(activate) or activate < 0 or
+            not math.isfinite(min_response) or not 0 <= min_response <= 1 or
+            smooth < 1 or smooth % 2 == 0):
+        raise ValueError('Invalid stabilization max_shift/activate_shift/min_response/smooth')
+    return {'mode': mode, 'border': border, 'reference': reference,
+            'max_shift': max_shift, 'activate_shift': activate,
+            'min_response': min_response, 'smooth': smooth}
+
+
+def seam_config(move, cfg):
+    """Normalize loop-seam repair settings; per-animation values win over global."""
+    raw = move.get('seam', cfg.get('seam'))
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError('seam must be an object')
+    mode = raw.get('mode', 'auto')
+    if mode not in ('off', 'auto', 'blend', 'morph'):
+        raise ValueError('seam.mode must be off, auto, blend or morph')
+    count = int(raw.get('transition_frames', 2))
+    tolerance = float(raw.get('tolerance', 0.02))
+    activate = float(raw.get('activate', 0.01))
+    step = raw.get('transition_ms')
+    step = None if step is None else float(step)
+    if (not 0 <= count <= 8 or not 0 <= tolerance <= 1 or
+            not 0 <= activate <= 1 or
+            (step is not None and (not math.isfinite(step) or step <= 0))):
+        raise ValueError('Invalid seam transition_frames/tolerance/activate/transition_ms')
+    return {'mode': mode, 'transition_frames': count, 'tolerance': tolerance,
+            'activate': activate, 'transition_ms': step}
+
+
+def translation(prev, cur, window, max_shift):
+    """Phase-correlation shift between consecutive downscaled frames."""
+    shift, response = cv2.phaseCorrelate(prev, cur, window)
+    dx, dy, confidence = float(shift[0]), float(shift[1]), float(response)
+    if (not math.isfinite(dx) or not math.isfinite(dy) or
+            not math.isfinite(confidence) or
+            abs(dx) > max_shift or abs(dy) > max_shift):
+        return 0.0, 0.0, 0.0
+    return dx, dy, confidence
+
+
+def camera_offsets(source, first, last, settings):
+    """Estimate low-frequency camera drift and return per-frame compensation.
+
+    Phase correlation is run on downscaled grayscale frames; a median filter
+    rejects spikes caused by subject motion. Compensation is applied to the
+    source frames BEFORE masking, so the fixed crop, scale, canvas and pivot
+    stay identical for every action.
+    """
+    cap = cv2.VideoCapture(str(source))
+    if not cap.isOpened():
+        raise ValueError('Cannot open source video for stabilization')
+    cap.set(cv2.CAP_PROP_POS_FRAMES, int(first))
+    grays, read, factor = [], [], None
+    try:
+        for index in range(int(first), int(last) + 1):
+            ok, bgr = cap.read()
+            if not ok:
+                break
+            gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+            height, width = gray.shape
+            factor = min(1.0, 256.0 / max(height, width))
+            small_w, small_h = max(8, round(width * factor)), max(8, round(height * factor))
+            grays.append(cv2.resize(gray, (small_w, small_h),
+                                    interpolation=cv2.INTER_AREA).astype(np.float32))
+            read.append(index)
+    finally:
+        cap.release()
+    if len(grays) < 2:
+        return {}, {'applied': False, 'reason': 'fewer than two decodable frames',
+                    'framesAnalyzed': len(grays), 'detectedShiftPixels': 0.0,
+                    'version': STABILIZE_VERSION}
+    window = cv2.createHanningWindow((grays[0].shape[1], grays[0].shape[0]), cv2.CV_32F)
+    path = [np.zeros(2, dtype=np.float64)]
+    rejected = 0
+    for k in range(1, len(grays)):
+        dx, dy, confidence = translation(grays[k - 1], grays[k], window,
+                                         settings['max_shift'] * factor)
+        if confidence < settings['min_response']:
+            rejected += 1
+            dx = dy = 0.0
+        path.append(path[-1] + np.array([dx, dy], dtype=np.float64))
+    path = np.stack(path)
+    if settings['smooth'] > 1 and len(path) >= settings['smooth']:
+        pad = settings['smooth'] // 2
+        padded = np.pad(path, ((pad, pad), (0, 0)), mode='edge')
+        path = np.stack([np.median(padded[i:i + settings['smooth']], axis=0)
+                         for i in range(len(path))])
+    if settings['reference'] == 'middle':
+        ref = len(read) // 2
+    elif settings['reference'] == 'first':
+        ref = 0
+    else:
+        ref = int(np.clip(settings['reference'] - read[0], 0, len(read) - 1))
+    offsets = (path - path[ref]) / factor
+    detected = float(np.max(np.linalg.norm(offsets, axis=1)))
+    applied = detected >= settings['activate_shift']
+    if not applied:
+        offsets = np.zeros_like(offsets)
+    stats = {'mode': settings['mode'], 'applied': bool(applied),
+             'detectedShiftPixels': detected,
+             'maxCompensatedPixels': float(np.max(np.linalg.norm(offsets, axis=1))) if applied else 0.0,
+             'meanCompensatedPixels': float(np.mean(np.linalg.norm(offsets, axis=1))) if applied else 0.0,
+             'referenceFrame': int(read[ref]), 'framesAnalyzed': len(read),
+             'rejectedEstimates': int(rejected), 'smooth': settings['smooth'],
+             'border': settings['border'], 'activateShift': settings['activate_shift'],
+             'version': STABILIZE_VERSION}
+    return ({int(i): [float(v[0]), float(v[1])] for i, v in zip(read, offsets)}, stats)
+
+
+def shift_image(image, dx, dy, border):
+    """Compensate a source frame by -offset in original-image pixels."""
+    rgb = np.asarray(image.convert('RGB'))
+    height, width = rgb.shape[:2]
+    matrix = np.float32([[1, 0, -dx], [0, 1, -dy]])
+    mode = {'replicate': cv2.BORDER_REPLICATE, 'reflect': cv2.BORDER_REFLECT,
+            'constant': cv2.BORDER_CONSTANT}[border]
+    warped = cv2.warpAffine(rgb, matrix, (width, height), flags=cv2.INTER_LINEAR,
+                            borderMode=mode, borderValue=(0, 0, 0))
+    return Image.fromarray(warped)
+
+
+def premultiplied(image):
+    data = np.asarray(image.convert('RGBA'), dtype=np.float32) / 255.0
+    alpha = data[..., 3:4]
+    return np.dstack((data[..., :3] * alpha, alpha)).copy()
+
+
+def from_premultiplied(value):
+    alpha = np.clip(value[..., 3:4], 0.0, 1.0)
+    rgb = np.clip(value[..., :3] / np.maximum(alpha, 1e-5), 0.0, 1.0)
+    return Image.fromarray(np.clip(np.dstack((rgb, alpha)) * 255.0, 0, 255).astype(np.uint8))
+
+
+def seam_difference(first, last):
+    """Premultiplied-alpha visual distance between the first and last frames."""
+    def feature(image):
+        small = image.copy()
+        small.thumbnail((96, 96), Image.Resampling.BILINEAR)
+        data = np.asarray(small.convert('RGBA'), dtype=np.float32) / 255.0
+        alpha = data[..., 3:4]
+        return np.dstack((data[..., :3] * alpha, alpha))
+    return float(np.abs(feature(first) - feature(last)).mean())
+
+
+def make_transitions(last, first, count, mode):
+    """Build in-between frames from last to first, optionally optical-flow warped."""
+    left, right = premultiplied(last), premultiplied(first)
+    height, width = left.shape[:2]
+    flow = None
+    if mode == 'morph':
+        gray_l = cv2.cvtColor((left[..., :3] * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        gray_r = cv2.cvtColor((right[..., :3] * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY)
+        if float(gray_l.std()) > 1.0 and float(gray_r.std()) > 1.0:
+            flow = cv2.calcOpticalFlowFarneback(
+                gray_l.astype(np.float32) / 255.0, gray_r.astype(np.float32) / 255.0,
+                None, 0.5, 3, 21, 3, 5, 1.2, 0)
+        else:
+            mode = 'blend'
+    grid_x, grid_y = np.meshgrid(np.arange(width, dtype=np.float32),
+                                 np.arange(height, dtype=np.float32))
+    result = []
+    for k in range(count):
+        t = (k + 1) / (count + 1)
+        moved = left
+        if flow is not None:
+            moved = cv2.remap(left, grid_x - flow[..., 0] * t, grid_y - flow[..., 1] * t,
+                              cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(0, 0, 0, 0))
+        result.append(from_premultiplied(moved * (1 - t) + right * t))
+    return result, mode
+
+
+def repair_loop_seam(frames, durations, settings):
+    """Numerically close the last-to-first jump with generated transition frames."""
+    report = {'applied': False, 'mode': settings['mode'], 'before': None, 'after': None,
+              'transitionFrames': 0, 'numericallyVerified': False,
+              'visualVerificationRequired': True, 'version': SEAM_VERSION}
+    if len(frames) < 3:
+        report['reason'] = 'need at least three frames'
+        return frames, durations, report
+    before = seam_difference(frames[0], frames[-1])
+    report.update({'before': before, 'after': before})
+    if settings['mode'] == 'off' or before <= settings['activate']:
+        report['reason'] = 'disabled' if settings['mode'] == 'off' else 'seam below activation threshold'
+        report['numericallyVerified'] = before <= settings['tolerance']
+        return frames, durations, report
+    count = settings['transition_frames']
+    if count < 1:
+        report['reason'] = 'transition_frames is zero'
+        return frames, durations, report
+    mode = settings['mode']
+    if mode == 'auto':
+        mode = 'morph' if before > 2 * settings['activate'] else 'blend'
+    extra, used_mode = make_transitions(frames[-1], frames[0], count, mode)
+    step = settings['transition_ms']
+    if step is None:
+        step = float(np.median(durations))
+    candidate = frames + extra
+    after = seam_difference(candidate[0], candidate[-1])
+    if after >= before:
+        report.update({'mode': used_mode, 'after': after,
+                       'reason': 'numeric seam did not improve; original frames kept'})
+        return frames, durations, report
+    report.update({'applied': True, 'mode': used_mode, 'after': after,
+                   'transitionFrames': count, 'transitionMs': step, 'improved': True,
+                   'numericallyVerified': after <= settings['tolerance']})
+    return candidate, durations + [step] * count, report
 
 
 def despill(rgb, alpha, settings):
@@ -402,10 +637,27 @@ def export(config):
     names = [m['name'] for m in moves]
     if not names or len(names) != len(set(names)) or any(not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]*', n) for n in names):
         raise ValueError('Animation names must be unique safe identifiers')
+    stab = stabilize_config(cfg)
+    needed = []
+    for move in moves:
+        if 'indices' in move:
+            needed.extend(int(i) for i in move['indices'])
+        else:
+            _, _, _, eligible = interval_frames(move, info)
+            needed.extend(int(i) for i in eligible)
+    if not needed:
+        raise ValueError('No source frames selected')
+    first_frame, last_frame = min(needed), max(needed)
+    offsets, stabilization = ({}, {'applied': False, 'reason': 'stabilize.mode=off',
+                                   'detectedShiftPixels': 0.0, 'version': STABILIZE_VERSION})
+    if stab['mode'] != 'off':
+        offsets, stabilization = camera_offsets(source, first_frame, last_frame, stab)
     work.mkdir(parents=True, exist_ok=True)
     stat = source.stat()
     identity = {'source': str(source), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
-                'mask': cfg['mask'], 'maskPipelineVersion': MASK_PIPELINE_VERSION}
+                'mask': cfg['mask'], 'maskPipelineVersion': MASK_PIPELINE_VERSION,
+                'stabilize': stab, 'stabilizeVersion': STABILIZE_VERSION,
+                'stabilizeRange': [first_frame, last_frame]}
     fingerprint = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:20]
     cache = work / 'masks' / fingerprint
     cache.mkdir(parents=True, exist_ok=True)
@@ -419,13 +671,18 @@ def export(config):
         if cached.exists():
             with Image.open(cached) as image:
                 return image.convert('RGBA')
-        rgba = masker.apply(read_frame(cap, index))
+        frame = read_frame(cap, index)
+        shift = offsets.get(int(index))
+        if shift and (abs(shift[0]) > 1e-6 or abs(shift[1]) > 1e-6):
+            frame = shift_image(frame, shift[0], shift[1], stab['border'])
+        rgba = masker.apply(frame)
         rgba.save(cached)
         return rgba
 
     manifest = {'version': 1, 'width': cw, 'height': ch, 'pivotX': pivot_x, 'pivotY': pivot_y,
                 'pixelsPerUnit': 100, 'maskMode': masker.mode, 'source': {k: v for k, v in info.items() if k != 'timestamps'},
-                'transform': {'crop': crop, 'scale': scale, 'resized': [rw, rh], 'offset': offset}, 'animations': []}
+                'transform': {'crop': crop, 'scale': scale, 'resized': [rw, rh], 'offset': offset},
+                'stabilization': stabilization, 'animations': []}
     reports, payload = {}, {}
     try:
         for move in moves:
@@ -445,28 +702,44 @@ def export(config):
             name = move['name']
             frame_dir = output / 'frames' / name
             frame_dir.mkdir()
-            cols = int(move.get('columns', min(6, len(indices))))
-            if cols < 1:
-                raise ValueError('columns must be positive')
-            atlas = Image.new('RGBA', (cw * cols, ch * math.ceil(len(indices) / cols)))
-            frames, files, meta, bounds = [], [], {}, []
-            for k, index in enumerate(indices):
+            frames, sources = [], []
+            for index in indices:
                 rgba = masked(index)
                 tile = rgba.crop(crop).resize((rw, rh), Image.Resampling.LANCZOS)
                 frame = Image.new('RGBA', (cw, ch))
                 frame.paste(tile, offset)
+                frames.append(frame)
+                sources.append({'sourceFrame': int(index),
+                                'sourceTimeSeconds': info['timestamps'][index]})
+            if move.get('loop'):
+                frames, durations, seam_report = repair_loop_seam(frames, durations, seam_config(move, cfg))
+            else:
+                seam_report = {'applied': False, 'mode': 'off', 'before': None, 'after': None,
+                               'transitionFrames': 0, 'numericallyVerified': False,
+                               'reason': 'not a looping animation',
+                               'visualVerificationRequired': True, 'version': SEAM_VERSION}
+            cols = int(move.get('columns', min(6, len(frames))))
+            if cols < 1:
+                raise ValueError('columns must be positive')
+            atlas = Image.new('RGBA', (cw * cols, ch * math.ceil(len(frames) / cols)))
+            files, meta, bounds = [], {}, []
+            for k, frame in enumerate(frames):
                 filename = f'{name}_{k:04d}.png'
                 frame.save(frame_dir / filename)
                 files.append(f'frames/{name}/{filename}')
                 x, y = k % cols * cw, k // cols * ch
                 atlas.paste(frame, (x, y))
                 bounds.append(frame.getchannel('A').getbbox())
-                meta[filename] = {'frame': {'x': x, 'y': y, 'w': cw, 'h': ch},
-                                  'rotated': False, 'trimmed': False,
-                                  'spriteSourceSize': {'x': 0, 'y': 0, 'w': cw, 'h': ch},
-                                  'sourceSize': {'w': cw, 'h': ch}, 'duration': durations[k],
-                                  'sourceFrame': index, 'sourceTimeSeconds': info['timestamps'][index]}
-                frames.append(frame)
+                entry = {'frame': {'x': x, 'y': y, 'w': cw, 'h': ch},
+                         'rotated': False, 'trimmed': False,
+                         'spriteSourceSize': {'x': 0, 'y': 0, 'w': cw, 'h': ch},
+                         'sourceSize': {'w': cw, 'h': ch}, 'duration': durations[k]}
+                if k < len(sources):
+                    entry.update(sources[k])
+                else:
+                    entry.update({'sourceFrame': None, 'sourceTimeSeconds': None,
+                                  'synthetic': 'loopSeamTransition'})
+                meta[filename] = entry
             image_path = output / 'atlases' / f'{name}.png'
             atlas.save(image_path)
             atlas_data = {'frames': meta, 'meta': {'image': image_path.name, 'format': 'RGBA8888',
@@ -488,7 +761,7 @@ def export(config):
             contact(atlas, output / 'previews' / f'{name}_contact.jpg')
             manifest['animations'].append({'name': name, 'files': files, 'durationMs': durations,
                                           'loop': bool(move.get('loop')), 'sourceFrames': indices,
-                                          'selection': analysis})
+                                          'seamRepair': seam_report, 'selection': analysis})
             reports[name] = {'count': len(frames), 'bounds': bounds,
                 'emptyFrames': [k for k, b in enumerate(bounds) if b is None],
                 'touchesCanvasEdge': [k for k, b in enumerate(bounds) if b is not None and
@@ -497,7 +770,10 @@ def export(config):
                 'previewTimingMs': {'webp': sum(ms), 'gif': sum(gif_ms)},
                 'selection': analysis, 'maskPipelineVersion': MASK_PIPELINE_VERSION,
                 'despill': cfg['mask'].get('despill'),
-                'loopSeamVerified': False, 'maskVisuallyVerified': False}
+                'stabilizationApplied': stabilization['applied'],
+                'seamRepair': seam_report,
+                'loopSeamVerified': bool(seam_report.get('numericallyVerified')),
+                'maskVisuallyVerified': False}
             payload[name] = {'data': atlas_data, 'image': 'data:image/png;base64,' + base64.b64encode(image_path.read_bytes()).decode()}
             print(f'{name}: {len(frames)} frames, {sum(durations):.2f}ms', flush=True)
     finally:
